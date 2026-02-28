@@ -19,7 +19,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import me.mudkip.moememos.R
-import me.mudkip.moememos.data.api.MemosV0Api
 import me.mudkip.moememos.data.api.MemosV1Api
 import me.mudkip.moememos.data.local.FileStorage
 import me.mudkip.moememos.data.local.MoeMemosDatabase
@@ -31,7 +30,6 @@ import me.mudkip.moememos.data.model.UserData
 import me.mudkip.moememos.data.model.UserSettings
 import me.mudkip.moememos.data.repository.AbstractMemoRepository
 import me.mudkip.moememos.data.repository.LocalDatabaseRepository
-import me.mudkip.moememos.data.repository.MemosV0Repository
 import me.mudkip.moememos.data.repository.MemosV1Repository
 import me.mudkip.moememos.data.repository.RemoteRepository
 import me.mudkip.moememos.data.repository.SyncingRepository
@@ -65,28 +63,11 @@ class AccountService @Inject constructor(
     sealed class LoginCompatibility {
         data class Supported(val accountCase: UserData.AccountCase) : LoginCompatibility()
         data class Unsupported(val message: String) : LoginCompatibility()
-        data class RequiresConfirmation(
-            val accountCase: UserData.AccountCase,
-            val version: String,
-            val message: String,
-        ) : LoginCompatibility()
     }
 
     sealed class SyncCompatibility {
         object Allowed : SyncCompatibility()
         data class Blocked(val message: String?) : SyncCompatibility()
-        data class RequiresConfirmation(val version: String, val message: String) : SyncCompatibility()
-    }
-
-    private data class ServerVersionInfo(
-        val accountCase: UserData.AccountCase,
-        val version: String,
-    )
-
-    private enum class VersionPolicy {
-        SUPPORTED,
-        TOO_LOW,
-        V1_HIGHER,
     }
 
     private val exportDateFormatter: DateTimeFormatter = DateTimeFormatter
@@ -151,20 +132,6 @@ class AccountService @Inject constructor(
                 this.repository = LocalDatabaseRepository(database.memoDao(), fileStorage, account)
                 this.remoteRepository = null
                 httpClient = okHttpClient
-            }
-            is Account.MemosV0 -> {
-                val (client, memosApi) = createMemosV0Client(account.info.host, account.info.accessToken)
-                val remote = MemosV0Repository(memosApi, account)
-                this.repository = SyncingRepository(
-                    database.memoDao(),
-                    fileStorage,
-                    remote,
-                    account
-                ) { user ->
-                    updateAccountFromSyncedUser(account.accountKey(), user)
-                }
-                this.remoteRepository = remote
-                this.httpClient = client
             }
             is Account.MemosV1 -> {
                 val (client, memosApi) = createMemosV1Client(account.info.host, account.info.accessToken)
@@ -336,29 +303,6 @@ class AccountService @Inject constructor(
         }
     }
 
-    fun createMemosV0Client(host: String, accessToken: String?): Pair<OkHttpClient, MemosV0Api> {
-        var client = okHttpClient
-
-        if (!accessToken.isNullOrEmpty()) {
-            client = client.newBuilder().addNetworkInterceptor { chain ->
-                var request = chain.request()
-                if (shouldAttachAccessToken(request.url, host)) {
-                    request = request.newBuilder().addHeader("Authorization", "Bearer $accessToken")
-                        .build()
-                }
-                chain.proceed(request)
-            }.build()
-        }
-
-        return client to Retrofit.Builder()
-            .baseUrl(host)
-            .client(client)
-            .addConverterFactory(networkJson.asConverterFactory("application/json".toMediaType()))
-            .addCallAdapterFactory(ApiResponseCallAdapterFactory.create())
-            .build()
-            .create(MemosV0Api::class.java)
-    }
-
     fun createMemosV1Client(host: String, accessToken: String?): Pair<OkHttpClient, MemosV1Api> {
         val client = okHttpClient.newBuilder().apply {
             if (!accessToken.isNullOrBlank()) {
@@ -383,95 +327,39 @@ class AccountService @Inject constructor(
             .create(MemosV1Api::class.java)
     }
 
-    suspend fun checkLoginCompatibility(host: String, allowHigherV1Version: Boolean = false): LoginCompatibility {
-        val serverVersion = detectAccountCaseAndVersion(host)
-        return when (evaluateVersionPolicy(serverVersion)) {
-            VersionPolicy.SUPPORTED -> LoginCompatibility.Supported(serverVersion.accountCase)
-            VersionPolicy.TOO_LOW -> LoginCompatibility.Unsupported(R.string.memos_supported_versions.string)
-            VersionPolicy.V1_HIGHER -> {
-                if (allowHigherV1Version) {
-                    LoginCompatibility.Supported(serverVersion.accountCase)
-                } else {
-                    LoginCompatibility.RequiresConfirmation(
-                        accountCase = serverVersion.accountCase,
-                        version = serverVersion.version,
-                        message = R.string.memos_login_version_higher_warning.string,
-                    )
-                }
-            }
+    suspend fun checkLoginCompatibility(host: String): LoginCompatibility {
+        val version = detectServerVersion(host)
+        return if (isSupportedVersion(version)) {
+            LoginCompatibility.Supported(UserData.AccountCase.MEMOS_V1)
+        } else {
+            LoginCompatibility.Unsupported(R.string.memos_supported_versions.string)
         }
     }
 
     suspend fun checkCurrentAccountSyncCompatibility(
         isAutomatic: Boolean,
-        allowHigherV1Version: String? = null,
     ): SyncCompatibility {
         awaitInitialization()
         val account = currentAccount.first() ?: return SyncCompatibility.Allowed
-        if (account !is Account.MemosV0 && account !is Account.MemosV1) {
+        if (account !is Account.MemosV1) {
             return SyncCompatibility.Allowed
         }
 
-        val serverVersion = fetchVersionForAccount(account)
+        val version = fetchVersionForAccount(account)
             ?: return if (isAutomatic) {
                 SyncCompatibility.Blocked(null)
             } else {
                 SyncCompatibility.Blocked(R.string.memos_supported_versions.string)
             }
-        return when (evaluateVersionPolicy(serverVersion)) {
-            VersionPolicy.SUPPORTED -> SyncCompatibility.Allowed
-            VersionPolicy.TOO_LOW -> {
-                if (isAutomatic) {
-                    SyncCompatibility.Blocked(null)
-                } else {
-                    SyncCompatibility.Blocked(R.string.memos_supported_versions.string)
-                }
-            }
-            VersionPolicy.V1_HIGHER -> {
-                val accepted = isUnsupportedSyncVersionAccepted(account.accountKey(), serverVersion.version)
-                if (isAutomatic) {
-                    return if (accepted) {
-                        SyncCompatibility.Allowed
-                    } else {
-                        SyncCompatibility.Blocked(null)
-                    }
-                }
-                if (allowHigherV1Version == serverVersion.version) {
-                    return SyncCompatibility.Allowed
-                }
-                if (accepted) {
-                    return SyncCompatibility.Allowed
-                }
-                SyncCompatibility.RequiresConfirmation(
-                    version = serverVersion.version,
-                    message = R.string.memos_sync_version_higher_warning.string,
-                )
+        return if (isSupportedVersion(version)) {
+            SyncCompatibility.Allowed
+        } else {
+            if (isAutomatic) {
+                SyncCompatibility.Blocked(null)
+            } else {
+                SyncCompatibility.Blocked(R.string.memos_supported_versions.string)
             }
         }
-    }
-
-    suspend fun rememberAcceptedUnsupportedSyncVersion(version: String) {
-        awaitInitialization()
-        val accountKey = currentAccount.first()?.accountKey() ?: return
-        mutex.withLock {
-            context.settingsDataStore.updateData { settings ->
-                val users = settings.usersList.toMutableList()
-                val index = users.indexOfFirst { it.accountKey == accountKey }
-                if (index == -1) {
-                    return@updateData settings
-                }
-                val user = users[index]
-                val versions = (user.settings.acceptedUnsupportedSyncVersions + version).distinct()
-                users[index] = user.copy(
-                    settings = user.settings.copy(acceptedUnsupportedSyncVersions = versions)
-                )
-                settings.copy(usersList = users)
-            }
-        }
-    }
-
-    suspend fun detectAccountCase(host: String): UserData.AccountCase {
-        return detectAccountCaseAndVersion(host).accountCase
     }
 
     suspend fun getRepository(): AbstractMemoRepository {
@@ -488,55 +376,24 @@ class AccountService @Inject constructor(
         }
     }
 
-    private suspend fun detectAccountCaseAndVersion(host: String): ServerVersionInfo {
-        val memosV0Status = createMemosV0Client(host, null).second.status().getOrNull()
-        val memosV0Version = memosV0Status?.profile?.version?.trim().orEmpty()
-        if (memosV0Version.isNotEmpty()) {
-            return ServerVersionInfo(UserData.AccountCase.MEMOS_V0, memosV0Version)
-        }
-
-        val memosV1Profile = createMemosV1Client(host, null).second.getProfile().getOrThrow()
-        val memosV1Version = memosV1Profile.version.trim()
-        if (memosV1Version.isNotEmpty()) {
-            return ServerVersionInfo(UserData.AccountCase.MEMOS_V1, memosV1Version)
-        }
-
-        return ServerVersionInfo(UserData.AccountCase.ACCOUNT_NOT_SET, "")
+    private suspend fun detectServerVersion(host: String): String {
+        val profile = createMemosV1Client(host, null).second.getProfile().getOrThrow()
+        return profile.version.trim()
     }
 
-    private suspend fun fetchVersionForAccount(account: Account): ServerVersionInfo? {
+    private suspend fun fetchVersionForAccount(account: Account): String? {
         return when (account) {
-            is Account.MemosV0 -> {
-                val version = createMemosV0Client(account.info.host, account.info.accessToken)
-                    .second
-                    .status()
-                    .getOrNull()
-                    ?.profile
-                    ?.version
-                    ?.trim()
-                    .orEmpty()
-                if (version.isBlank()) null else ServerVersionInfo(UserData.AccountCase.MEMOS_V0, version)
-            }
             is Account.MemosV1 -> {
-                val version = createMemosV1Client(account.info.host, account.info.accessToken)
+                createMemosV1Client(account.info.host, account.info.accessToken)
                     .second
                     .getProfile()
                     .getOrNull()
                     ?.version
                     ?.trim()
-                    .orEmpty()
-                if (version.isBlank()) null else ServerVersionInfo(UserData.AccountCase.MEMOS_V1, version)
+                    ?.ifBlank { null }
             }
             else -> null
         }
-    }
-
-    private suspend fun isUnsupportedSyncVersionAccepted(accountKey: String, version: String): Boolean {
-        val userData = context.settingsDataStore.data.first()
-            .usersList
-            .firstOrNull { it.accountKey == accountKey }
-            ?: return false
-        return userData.settings.acceptedUnsupportedSyncVersions.contains(version)
     }
 
     private fun parseAccountWithSecureToken(userData: UserData): Account? {
@@ -544,7 +401,6 @@ class AccountService @Inject constructor(
         val token = secureTokenStorage.getToken(userData.accountKey)
             .orEmpty()
         return when (account) {
-            is Account.MemosV0 -> Account.MemosV0(account.info.copy(accessToken = token))
             is Account.MemosV1 -> Account.MemosV1(account.info.copy(accessToken = token))
             is Account.Local -> account
         }
@@ -552,11 +408,6 @@ class AccountService @Inject constructor(
 
     private fun Account.toPersistedUserData(settings: UserSettings): UserData {
         return when (this) {
-            is Account.MemosV0 -> UserData(
-                settings = settings,
-                accountKey = accountKey(),
-                memosV0 = info.copy(accessToken = "")
-            )
             is Account.MemosV1 -> UserData(
                 settings = settings,
                 accountKey = accountKey(),
@@ -572,7 +423,6 @@ class AccountService @Inject constructor(
 
     private fun persistAccessToken(account: Account) {
         when (account) {
-            is Account.MemosV0 -> secureTokenStorage.saveToken(account.accountKey(), account.info.accessToken)
             is Account.MemosV1 -> secureTokenStorage.saveToken(account.accountKey(), account.info.accessToken)
             is Account.Local -> Unit
         }
@@ -589,26 +439,12 @@ class AccountService @Inject constructor(
         initialization.await()
     }
 
-    private fun evaluateVersionPolicy(serverVersion: ServerVersionInfo): VersionPolicy {
-        val version = SemVer.parseOrNull(serverVersion.version) ?: return VersionPolicy.TOO_LOW
-        return when (serverVersion.accountCase) {
-            UserData.AccountCase.MEMOS_V0 -> {
-                if (version < MEMOS_V0_MIN_VERSION) VersionPolicy.TOO_LOW else VersionPolicy.SUPPORTED
-            }
-            UserData.AccountCase.MEMOS_V1 -> {
-                when {
-                    version < MEMOS_V1_MIN_VERSION -> VersionPolicy.TOO_LOW
-                    version > MEMOS_V1_MAX_VERSION -> VersionPolicy.V1_HIGHER
-                    else -> VersionPolicy.SUPPORTED
-                }
-            }
-            else -> VersionPolicy.TOO_LOW
-        }
+    private fun isSupportedVersion(version: String): Boolean {
+        val semVer = SemVer.parseOrNull(version) ?: return false
+        return semVer >= MEMOS_V1_MIN_VERSION
     }
 
     companion object {
-        private val MEMOS_V0_MIN_VERSION = SemVer(0, 21, 0)
-        private val MEMOS_V1_MIN_VERSION = SemVer(0, 26, 0)
-        private val MEMOS_V1_MAX_VERSION = SemVer(0, 26, 2)
+        private val MEMOS_V1_MIN_VERSION = SemVer(0, 25, 0)
     }
 }

@@ -7,6 +7,7 @@ import com.skydoves.sandwich.onSuccess
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import me.mudkip.moememos.data.api.GetCurrentUserResponse
 import me.mudkip.moememos.data.api.CreateResourceRequest
 import me.mudkip.moememos.data.api.MemosV1Api
 import me.mudkip.moememos.data.api.MemosV1CreateMemoRequest
@@ -148,14 +149,26 @@ class MemosV1Repository(
         pinned: Boolean?,
         archived: Boolean?
     ): ApiResponse<Memo> {
-        val resp = memosApi.updateMemo(getId(remoteId), UpdateMemoRequest(
-            content = content,
-            visibility = visibility?.let { MemosVisibility.fromMemoVisibility(it) },
-            pinned = pinned,
-            state = archived?.let { isArchived -> if (isArchived) MemosV1State.ARCHIVED else MemosV1State.NORMAL },
-            updateTime = Instant.now(),
-            attachments = resourceRemoteIds?.map { MemosV1Resource(name = getName(it)) }
-        )).mapSuccess { convertMemo(this) }
+        val updateMaskFields = buildList {
+            if (content != null) add("content")
+            if (visibility != null) add("visibility")
+            if (pinned != null) add("pinned")
+            if (archived != null) add("state")
+            add("update_time")
+            if (resourceRemoteIds != null) add("attachments")
+        }
+        val resp = memosApi.updateMemo(
+            getId(remoteId),
+            UpdateMemoRequest(
+                content = content,
+                visibility = visibility?.let { MemosVisibility.fromMemoVisibility(it) },
+                pinned = pinned,
+                state = archived?.let { isArchived -> if (isArchived) MemosV1State.ARCHIVED else MemosV1State.NORMAL },
+                updateTime = Instant.now(),
+                attachments = resourceRemoteIds?.map { MemosV1Resource(name = getName(it)) }
+            ),
+            updateMaskFields.joinToString(",")
+        ).mapSuccess { convertMemo(this) }
         return resp
     }
 
@@ -191,17 +204,25 @@ class MemosV1Repository(
         return memosApi.deleteResource(getId(remoteId))
     }
 
+    private fun GetCurrentUserResponse.toUser(): User {
+        if (user == null) {
+            throw MoeMemosException.notLogin
+        }
+        return User(
+            user.name,
+            user.displayName ?: user.username,
+            user.createTime ?: Instant.now(),
+            avatarUrl = user.avatarUrl
+        )
+    }
+
     override suspend fun getCurrentUser(): ApiResponse<User> {
-        val resp = memosApi.getCurrentUser().mapSuccess {
-            if (user == null) {
-                throw MoeMemosException.notLogin
-            }
-            User(
-                user.name,
-                user.displayName ?: user.username,
-                user.createTime ?: Instant.now(),
-                avatarUrl = user.avatarUrl
-            )
+        // Try 0.26+ endpoint first, fall back to 0.25.x endpoint
+        val authResp = memosApi.getCurrentUser()
+        var resp = if (authResp is ApiResponse.Success && authResp.data.user != null) {
+            authResp.mapSuccess { toUser() }
+        } else {
+            memosApi.getCurrentSession().mapSuccess { toUser() }
         }
         if (resp !is ApiResponse.Success) {
             return resp

@@ -57,14 +57,11 @@ fun MemosHomePage(
     }
     var syncAlert by remember { mutableStateOf<HomeSyncAlert?>(null) }
 
-    suspend fun requestManualSync(allowHigherV1Version: String? = null) {
-        when (val result = memosViewModel.refreshMemos(allowHigherV1Version)) {
+    suspend fun requestManualSync() {
+        when (val result = memosViewModel.refreshMemos()) {
             ManualSyncResult.Completed -> Unit
             is ManualSyncResult.Blocked -> {
                 syncAlert = HomeSyncAlert.Blocked(result.message)
-            }
-            is ManualSyncResult.RequiresConfirmation -> {
-                syncAlert = HomeSyncAlert.RequiresConfirmation(result.version, result.message)
             }
             is ManualSyncResult.Failed -> {
                 syncAlert = HomeSyncAlert.Failed(result.message)
@@ -145,30 +142,6 @@ fun MemosHomePage(
                 }
             )
         }
-        is HomeSyncAlert.RequiresConfirmation -> {
-            AlertDialog(
-                onDismissRequest = { syncAlert = null },
-                title = { Text(R.string.unsupported_memos_version_title.string) },
-                text = { Text(alert.message) },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            syncAlert = null
-                            scope.launch {
-                                requestManualSync(allowHigherV1Version = alert.version)
-                            }
-                        }
-                    ) {
-                        Text(R.string.still_sync.string)
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { syncAlert = null }) {
-                        Text(R.string.cancel.string)
-                    }
-                }
-            )
-        }
         is HomeSyncAlert.Failed -> {
             AlertDialog(
                 onDismissRequest = { syncAlert = null },
@@ -186,6 +159,5 @@ fun MemosHomePage(
 
 private sealed class HomeSyncAlert {
     data class Blocked(val message: String) : HomeSyncAlert()
-    data class RequiresConfirmation(val version: String, val message: String) : HomeSyncAlert()
     data class Failed(val message: String) : HomeSyncAlert()
 }

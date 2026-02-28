@@ -17,14 +17,12 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.mudkip.moememos.R
-import me.mudkip.moememos.data.api.MemosV0User
 import me.mudkip.moememos.data.api.MemosV1User
 import me.mudkip.moememos.data.constant.MoeMemosException
 import me.mudkip.moememos.data.model.Account
 import me.mudkip.moememos.data.model.LocalAccount
 import me.mudkip.moememos.data.model.MemosAccount
 import me.mudkip.moememos.data.model.User
-import me.mudkip.moememos.data.model.UserData
 import me.mudkip.moememos.data.service.AccountService
 import me.mudkip.moememos.ext.string
 import me.mudkip.moememos.ext.suspendOnNotLogin
@@ -50,7 +48,6 @@ class UserStateViewModel @Inject constructor(
         viewModelScope.launch {
             accountService.currentAccount.collectLatest {
                 host = when(it) {
-                    is Account.MemosV0 -> it.info.host
                     is Account.MemosV1 -> it.info.host
                     else -> ""
                 }
@@ -75,7 +72,6 @@ class UserStateViewModel @Inject constructor(
             when (val compatibility = accountService.checkLoginCompatibility(host)) {
                 is AccountService.LoginCompatibility.Supported -> LoginCompatibility.Supported
                 is AccountService.LoginCompatibility.Unsupported -> LoginCompatibility.Unsupported(compatibility.message)
-                is AccountService.LoginCompatibility.RequiresConfirmation -> LoginCompatibility.RequiresConfirmation(compatibility.message)
             }
         } catch (e: Throwable) {
             LoginCompatibility.Unsupported(e.localizedMessage ?: e.message ?: "")
@@ -85,38 +81,16 @@ class UserStateViewModel @Inject constructor(
     suspend fun loginMemosWithAccessToken(
         host: String,
         accessToken: String,
-        allowHigherV1Version: Boolean = false,
     ): ApiResponse<Unit> = withContext(viewModelScope.coroutineContext) {
         try {
-            val compatibility = accountService.checkLoginCompatibility(host, allowHigherV1Version)
-            val accountCase = when (compatibility) {
-                is AccountService.LoginCompatibility.Supported -> compatibility.accountCase
+            val compatibility = accountService.checkLoginCompatibility(host)
+            when (compatibility) {
+                is AccountService.LoginCompatibility.Supported -> Unit
                 is AccountService.LoginCompatibility.Unsupported -> {
                     return@withContext ApiResponse.exception(MoeMemosException(compatibility.message))
                 }
-                is AccountService.LoginCompatibility.RequiresConfirmation -> {
-                    return@withContext ApiResponse.exception(MoeMemosException(compatibility.message))
-                }
             }
-            when (accountCase) {
-                UserData.AccountCase.MEMOS_V1 -> loginMemosV1WithAccessToken(host, accessToken)
-                UserData.AccountCase.MEMOS_V0 -> loginMemosV0WithAccessToken(host, accessToken)
-                else -> throw MoeMemosException.invalidServer
-            }
-        } catch (e: Throwable) {
-            ApiResponse.exception(e)
-        }
-    }
-
-    private suspend fun loginMemosV0WithAccessToken(host: String, accessToken: String): ApiResponse<Unit> = withContext(viewModelScope.coroutineContext) {
-        try {
-            val resp = accountService.createMemosV0Client(host, accessToken).second.me()
-            if (resp !is ApiResponse.Success) {
-                return@withContext resp.mapSuccess {}
-            }
-            accountService.addAccount(getAccount(host, accessToken, resp.data))
-            currentUser = resp.data.toUser()
-            ApiResponse.Success(Unit)
+            loginMemosV1WithAccessToken(host, accessToken)
         } catch (e: Throwable) {
             ApiResponse.exception(e)
         }
@@ -124,7 +98,12 @@ class UserStateViewModel @Inject constructor(
 
     private suspend fun loginMemosV1WithAccessToken(host: String, accessToken: String): ApiResponse<Unit> = withContext(viewModelScope.coroutineContext) {
         try {
-            val resp = accountService.createMemosV1Client(host, accessToken).second.getCurrentUser()
+            val api = accountService.createMemosV1Client(host, accessToken).second
+            // Try 0.26+ endpoint first, fall back to 0.25.x endpoint
+            var resp = api.getCurrentUser()
+            if (resp !is ApiResponse.Success || resp.data.user == null) {
+                resp = api.getCurrentSession()
+            }
             if (resp !is ApiResponse.Success) {
                 return@withContext resp.mapSuccess {}
             }
@@ -164,18 +143,6 @@ class UserStateViewModel @Inject constructor(
         }
     }
 
-    private fun getAccount(host: String, accessToken: String, user: MemosV0User): Account = Account.MemosV0(
-        info = MemosAccount(
-            host = host,
-            accessToken = accessToken,
-            id = user.id,
-            name = user.username ?: user.displayName,
-            avatarUrl = user.avatarUrl ?: "",
-            startDateEpochSecond = user.createdTs,
-            defaultVisibility = user.toUser().defaultVisibility.name,
-        )
-    )
-
     private fun getAccount(host: String, accessToken: String, user: MemosV1User): Account = Account.MemosV1(
         info = MemosAccount(
             host = host,
@@ -191,7 +158,6 @@ class UserStateViewModel @Inject constructor(
 sealed class LoginCompatibility {
     object Supported : LoginCompatibility()
     data class Unsupported(val message: String) : LoginCompatibility()
-    data class RequiresConfirmation(val message: String) : LoginCompatibility()
 }
 
 val LocalUserState =

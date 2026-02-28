@@ -44,28 +44,6 @@ enum class MemosVisibility {
 }
 
 @Serializable
-enum class MemosRowStatus {
-    @SerialName("ROW_STATUS_UNSPECIFIED")
-    ROW_STATUS_UNSPECIFIED,
-    @SerialName("NORMAL")
-    NORMAL,
-    @SerialName("ARCHIVED")
-    ARCHIVED,
-    @SerialName("ACTIVE")
-    ACTIVE,
-}
-
-@Serializable
 data class MemosProfile(
     val version: String
 )
-
-@Serializable
-enum class MemosView {
-    @SerialName("MEMO_VIEW_UNSPECIFIED")
-    MEMO_VIEW_UNSPECIFIED,
-    @SerialName("MEMO_VIEW_FULL")
-    MEMO_VIEW_FULL,
-    @SerialName("MEMO_VIEW_METADATA_ONLY")
-    MEMO_VIEW_METADATA_ONLY,
-}

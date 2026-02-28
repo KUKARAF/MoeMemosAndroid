@@ -18,6 +18,9 @@ interface MemosV1Api {
     @GET("api/v1/auth/me")
     suspend fun getCurrentUser(): ApiResponse<GetCurrentUserResponse>
 
+    @GET("api/v1/auth/sessions/current")
+    suspend fun getCurrentSession(): ApiResponse<GetCurrentUserResponse>
+
     @GET("api/v1/users/{id}/settings/GENERAL")
     suspend fun getUserSetting(@Path("id") userId: String): ApiResponse<MemosV1UserSetting>
 
@@ -33,7 +36,7 @@ interface MemosV1Api {
     suspend fun createMemo(@Body body: MemosV1CreateMemoRequest): ApiResponse<MemosV1Memo>
 
     @PATCH("api/v1/memos/{id}")
-    suspend fun updateMemo(@Path("id") memoId: String, @Body body: UpdateMemoRequest): ApiResponse<MemosV1Memo>
+    suspend fun updateMemo(@Path("id") memoId: String, @Body body: UpdateMemoRequest, @Query("updateMask") updateMask: String): ApiResponse<MemosV1Memo>
 
     @DELETE("api/v1/memos/{id}")
     suspend fun deleteMemo(@Path("id") memoId: String): ApiResponse<Unit>
